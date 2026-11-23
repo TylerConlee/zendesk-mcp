@@ -87,6 +87,7 @@ def install(fake):
     fake.on("GET", "/api/v2/organizations", {"organizations": ORGS, "meta": {"has_more": False}})
     fake.on("GET", "/api/v2/organizations/show_many", lambda r: {
         "organizations": [o for o in ORGS if str(o["id"]) in r.url.params["ids"].split(",")]})
+    fake.on("GET", "/api/v2/organizations/50", {"organization": ORGS[0]})
     fake.on("GET", "/api/v2/organizations/autocomplete", lambda r: {
         "organizations": [o for o in ORGS if o["name"].lower().startswith(r.url.params["name"].lower())]})
 
@@ -134,3 +135,41 @@ async def test_account_health_renewal_and_segment_filters(connect, fake):
     assert out["scope"]["filters"]["renewal_field"] == "Renewal date"
     assert [r["organization"] for r in anon["customers"]] == ["Customer 1"] and "id" not in anon["customers"][0]
     assert bad.is_error and "No organization field called 'nope'" in bad.content[0].text
+
+
+# ----------------------------------------------------------------------------- customer_timeline
+
+async def test_customer_timeline(connect, fake):
+    install(fake)
+    fake.on("GET", "/api/v2/organizations/50/related", {"organization_related": {"users_count": 4}})
+    async with connect() as cl:
+        out = data(await cl.call_tool("customer_timeline", {"organization": "Acme Corp"}))
+    # last 365 days = 2025-10-15 .. 2026-10-14: Acme's tickets 21 (May), 11, 12 (Aug), 1, 2, 3, 5 (Sept)
+    s = out["summary"]
+    assert (s["tickets"], s["still_open"], s["urgent_or_high"]) == (7, 1, 2)
+    assert s["csat"] == {"good": 2, "bad": 2, "score_pct": 50.0}
+    assert s["busiest_month"] == {"month": "2026-09", "tickets": 4}
+    assert s["first_ticket"] == "2026-05-01T12:00:00Z"
+    ev = [(e["event"], e.get("ticket_id")) for e in out["timeline"]]
+    # routine tickets 11 and 12 aren't listed by default; 1 and 21 are (rated)
+    assert ("ticket opened", 11) not in ev and ("ticket opened", 21) in ev and ("rated good", 21) in ev
+    assert ("ticket opened", 2) in ev and ("rated bad", 2) in ev and ("solved", 2) in ev
+    solved2 = next(e for e in out["timeline"] if e["event"] == "solved" and e["ticket_id"] == 2)
+    assert solved2["reopened"] == 1
+    opened3 = next(e for e in out["timeline"] if e["event"] == "ticket opened" and e["ticket_id"] == 3)
+    assert opened3["still_open"] and opened3["url"].endswith("/agent/tickets/3")
+    quiet = [e for e in out["timeline"] if e["event"].startswith("quiet")]
+    # 2025-10-15 -> May 1 (198 days) and May 1 -> Aug 5 (96 days)
+    assert [q["event"] for q in quiet] == ["quiet for 198 days", "quiet for 96 days"]
+    assert len(out["monthly"]) == 13 and out["monthly"][-2] == {
+        "month": "2026-09", "tickets": 4, "solved": 3, "urgent_or_high": 2, "csat_good": 1, "csat_bad": 2,
+        "frt_median_min": 22.5, "full_resolution_median_min": 100}
+    assert out["customer"]["users"] == 4
+
+
+async def test_customer_timeline_all_tickets(connect, fake):
+    install(fake)
+    async with connect() as cl:
+        out = data(await cl.call_tool("customer_timeline", {"organization": "50", "include_routine": True,
+                                                            "period": "2026-08"}))
+    assert [e["ticket_id"] for e in out["timeline"] if e["event"] == "ticket opened"] == [11, 12]

@@ -4,17 +4,18 @@ segment filters) and a chronological history of one customer's support relations
 import asyncio
 import re
 from collections import Counter, defaultdict
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Annotated, Any
 
 from pydantic import Field
 
 from ..client import ZendeskClient, ZendeskError
-from ..metrics import parse_ts, rate, utcnow
+from ..metrics import parse_ts, rate, summarize, utcnow
 from ..periods import PERIOD_HELP, resolve_period
 from ..toolkit import Toolkit
 from .analytics import _compact, _find_tickets, _gather, _kpis, load_dataset
-from .reporting import field_catalog
+from .customers import _only_org, _org_context, resolve_org
+from .reporting import _redactor_for, field_catalog
 
 # Org fields worth showing next to a health score when the caller doesn't name any.
 INTERESTING_FIELD = re.compile(r"renew|arr\b|mrr|plan|tier|segment|csm|success.?manager|health|strategic|"
@@ -303,3 +304,136 @@ def register(tk: Toolkit) -> None:
         if notes:
             result["data_notes"] = notes
         return tk.out(result)
+
+    @tk.tool("read", title="Customer timeline")
+    async def customer_timeline(
+        organization: Annotated[str, Field(description="Organization name (exact, prefix or keywords) or ID.")],
+        period: Annotated[str | None, Field(description=PERIOD_HELP + " Default: last_365_days.")] = None,
+        start: Annotated[str | None, Field(description="Start date YYYY-MM-DD (inclusive). Overrides period.")] = None,
+        end: Annotated[str | None, Field(description="End date YYYY-MM-DD (exclusive). Overrides period.")] = None,
+        quiet_gap_days: Annotated[int, Field(ge=7, le=365, description="Call out gaps with no new tickets at "
+                                             "least this long.")] = 30,
+        include_routine: Annotated[bool, Field(description="List every ticket. Off: only notable ones (urgent/high, "
+                                               "rated, reopened, linked to a problem, slow, still open) — counts "
+                                               "still cover everything.")] = False,
+        redact: Annotated[bool, Field(description="Strip names, emails, links and long numbers from text.")] = True,
+        limit: Annotated[int, Field(ge=10, le=1000, description="Most recent events kept.")] = 150,
+        max_tickets: Annotated[int, Field(ge=1, le=50000)] = 5000,
+    ) -> str:
+        """One customer's support history in date order, for QBRs, account handovers and renewal prep: when each
+        notable ticket arrived and was solved, urgent and high-priority issues, CSAT ratings with comments,
+        reopens, links to problem tickets, quiet stretches with no tickets, and what's still open — plus a
+        month-by-month rollup (tickets, solved, urgent/high, CSAT, first reply and resolution medians) and
+        account facts. Default: the last 365 days."""
+        org = await resolve_org(zd, organization)
+        oid = org["id"]
+        p = resolve_period(period, start, end, default="last_365_days")
+        now = utcnow()
+        raw, context = await asyncio.gather(load_dataset(tk, p, "created", f"organization:{oid}", max_tickets),
+                                            _org_context_safe(zd, org))
+        ds = _only_org(raw, oid)
+        red = _redactor_for(ds.users, redact)
+        tickets = sorted(ds.tickets, key=lambda t: t.get("created_at") or "")
+        url = f"https://{tk.settings.host}/agent/tickets/"
+        events: list[dict[str, Any]] = []
+        for t in tickets:
+            m = ds.metrics.get(t["id"]) or {}
+            rating = t.get("satisfaction_rating") or {}
+            full = (m.get("full_resolution_time_in_minutes") or {}).get("calendar")
+            open_ = t.get("status") in OPEN
+            notable = (t.get("priority") in ("urgent", "high") or rating.get("score") in ("good", "bad")
+                       or m.get("reopens") or t.get("problem_id") or open_ or (full or 0) >= 7 * 1440)
+            if not (notable or include_routine):
+                continue
+            e: dict[str, Any] = {"at": t.get("created_at"), "event": "ticket opened", "ticket_id": t["id"],
+                                 "subject": red(t.get("subject")), "priority": t.get("priority"),
+                                 "channel": (t.get("via") or {}).get("channel")}
+            if t.get("problem_id"):
+                e["linked_problem"] = t["problem_id"]
+            if open_:
+                e["still_open"] = True
+            events.append(e)
+            solved_at = m.get("solved_at")
+            if solved_at and not open_:
+                s: dict[str, Any] = {"at": solved_at, "event": "solved", "ticket_id": t["id"]}
+                if full is not None:
+                    s["took_days"] = round(full / 1440, 1)
+                if m.get("reopens"):
+                    s["reopened"] = m["reopens"]
+                events.append(s)
+                if rating.get("score") in ("good", "bad"):
+                    r = {"at": solved_at, "event": f"rated {rating['score']}", "ticket_id": t["id"]}
+                    if rating.get("comment"):
+                        r["comment"] = red(rating["comment"])
+                    if rating.get("reason"):
+                        r["reason"] = rating["reason"]
+                    events.append(r)
+        created = [parse_ts(t["created_at"]) for t in tickets if t.get("created_at")]
+        stops = [datetime_of(p.start)] + created + [min(now, datetime_of(p.end))]
+        for a, b in zip(stops, stops[1:]):
+            gap = (b - a).days
+            if gap >= quiet_gap_days:
+                events.append({"at": a.isoformat(), "event": f"quiet for {gap} days", "until": b.isoformat()})
+        events.sort(key=lambda e: e["at"] or "")
+        for e in events:
+            if "ticket_id" in e and e["event"] == "ticket opened":
+                e["url"] = url + str(e["ticket_id"])
+
+        by_month: dict[str, list[dict]] = defaultdict(list)
+        for t in tickets:
+            by_month[(t.get("created_at") or "")[:7]].append(t)
+        months = []
+        cur = p.start.replace(day=1)
+        while cur < p.end:
+            key = cur.strftime("%Y-%m")
+            ts = by_month.get(key, [])
+            k = _compact(_kpis(ts, ds.metrics))
+            months.append({"month": key, "tickets": len(ts), "solved": k["solved"],
+                           "urgent_or_high": sum(1 for t in ts if t.get("priority") in ("urgent", "high")),
+                           "csat_good": sum(1 for t in ts if (t.get("satisfaction_rating") or {}).get("score") == "good"),
+                           "csat_bad": sum(1 for t in ts if (t.get("satisfaction_rating") or {}).get("score") == "bad"),
+                           "frt_median_min": k["frt_median_min"],
+                           "full_resolution_median_min": k["full_resolution_median_min"]})
+            cur = (cur.replace(day=28) + timedelta(days=4)).replace(day=1)
+        busiest = max(months, key=lambda r: r["tickets"]) if months and any(r["tickets"] for r in months) else None
+        longest = max(tickets, key=lambda t: (ds.metrics.get(t["id"]) or {}).get("full_resolution_time_in_minutes",
+                                                                                 {}).get("calendar") or 0, default=None)
+        lm = (ds.metrics.get(longest["id"]) or {}) if longest else {}
+        k_all = _kpis(tickets, ds.metrics)
+        result: dict[str, Any] = {
+            "customer": context,
+            "scope": {**ds.scope(), "generated_at": now.isoformat(), "events_shown": min(len(events), limit),
+                      "events_total": len(events), "all_tickets_listed": include_routine},
+            "summary": {
+                "tickets": len(tickets), "still_open": sum(1 for t in tickets if t.get("status") in OPEN),
+                "urgent_or_high": sum(1 for t in tickets if t.get("priority") in ("urgent", "high")),
+                "csat": {"good": k_all["csat"]["good"], "bad": k_all["csat"]["bad"], "score_pct": k_all["csat"]["score_pct"]},
+                "first_ticket": tickets[0].get("created_at") if tickets else None,
+                "last_ticket": tickets[-1].get("created_at") if tickets else None,
+                "busiest_month": {"month": busiest["month"], "tickets": busiest["tickets"]} if busiest else None,
+                "longest_to_resolve": {"ticket_id": longest["id"], "subject": red(longest.get("subject")),
+                                       "days": round(lm["full_resolution_time_in_minutes"]["calendar"] / 1440, 1)}
+                if longest and (lm.get("full_resolution_time_in_minutes") or {}).get("calendar") else None,
+                "resolution_median_days": round(summarize(
+                    [(ds.metrics.get(t["id"]) or {}).get("full_resolution_time_in_minutes", {}).get("calendar")
+                     for t in tickets])["median"] / 1440, 1) if any(
+                    (ds.metrics.get(t["id"]) or {}).get("full_resolution_time_in_minutes", {}).get("calendar")
+                    for t in tickets) else None,
+            },
+            "monthly": months,
+            "timeline": events[-limit:],
+        }
+        if len(events) > limit:
+            result["timeline_note"] = f"Oldest {len(events) - limit} events left out (limit)."
+        return tk.out(result)
+
+
+def datetime_of(d: date) -> datetime:
+    return datetime.combine(d, datetime.min.time(), timezone.utc)
+
+
+async def _org_context_safe(zd: ZendeskClient, org: dict) -> dict[str, Any]:
+    try:
+        return await _org_context(zd, org)
+    except ZendeskError:
+        return {"id": org["id"], "name": org.get("name")}
