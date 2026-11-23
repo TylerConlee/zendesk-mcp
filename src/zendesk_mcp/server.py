@@ -8,8 +8,8 @@ from mcp.server.mcpserver import MCPServer
 from .client import ZendeskClient
 from .config import Settings
 from .toolkit import Toolkit
-from .tools import (admin, advanced, analytics, blueprint, changes, customers, docs, helpcenter, people, reporting,
-                    resources, search, tickets)
+from .tools import (accounts, admin, advanced, analytics, blueprint, changes, customers, docs, followups, helpcenter,
+                    operations, patterns, people, reporting, resources, search, tickets)
 
 INSTRUCTIONS = """Full-access Zendesk Support + Help Center server.
 
@@ -29,7 +29,16 @@ Drill down with kpi_trends, ticket_topics, sample_ticket_text (free-text themes)
 top_issues, help_center_report. Goals live in report_targets.
 Customers: customer_profile(organization=...) profiles one organization — volume, response/resolution performance vs
 previous period and all customers, backlog, SLA, hardest tickets and sentiment (CSAT, AI sentiment fields, message
-tone with excerpts). Lead with its `signals`; treat conversation tone as a heuristic and check the excerpts. Periods accept shorthands like last_quarter or 2026-Q3.
+tone with excerpts). Lead with its `signals`; treat conversation tone as a heuristic and check the excerpts.
+account_health ranks every customer by risk with reasons (filter to renewals due soon, tags or org field values);
+customer_timeline gives one customer's history in date order.
+Follow-through: promise_tracker finds commitments agents made ("I'll follow up tomorrow") and which are overdue, plus
+customers waiting on us; ticket_brief summarises one ticket (timeline, waits, tone, related tickets) for escalations.
+Patterns: emerging_issues finds problems spreading across customers right now; deflection_finder finds repetitive
+tickets worth a macro, article or auto-reply (with the typical reply as a draft).
+Operations: routing_report (first group vs solving group, transfer paths, who moves tickets), macro_report (usage,
+outcomes, unused, duplicates), agent_profile (one agent for a 1:1 — manager use only), capacity_forecast (demand vs
+solve capacity, projected backlog, busiest slots). Periods accept shorthands like last_quarter or 2026-Q3.
 For company-wide audiences keep team_level=true and redact=true (the defaults).
 Administration: list_agents, provision_agents, offboard_agent (dry run by default); rule_definitions before building
 triggers/views/macros/automations; preview_view to test view conditions; reorder; find_references before renaming,
@@ -61,7 +70,7 @@ def build_server(settings: Settings, transport: httpx.AsyncBaseTransport | None 
     if on("core"):
         modules += [search, tickets, people, resources, helpcenter, advanced]
     if on("analytics"):
-        modules += [analytics, reporting, customers]
+        modules += [analytics, reporting, customers, accounts, followups, patterns, operations]
     if on("admin"):
         modules += [admin, blueprint, docs]
     if on("core") or on("admin"):
