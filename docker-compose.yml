@@ -1,0 +1,15 @@
+services:
+  zendesk-mcp:
+    build: .
+    image: zendesk-mcp:latest
+    container_name: zendesk-mcp
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      MCP_TRANSPORT: http
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: "8000"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data   # attachments saved with download_attachment(save_to=...) land here

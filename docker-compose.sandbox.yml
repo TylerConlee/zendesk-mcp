@@ -1,0 +1,18 @@
+# Second instance pointed at a Zendesk sandbox, for rehearsing admin changes.
+#   cp .env .env.sandbox   (set ZENDESK_SUBDOMAIN + credentials for the sandbox)
+#   docker compose -f docker-compose.sandbox.yml up -d --build
+services:
+  zendesk-mcp-sandbox:
+    build: .
+    image: zendesk-mcp:latest
+    container_name: zendesk-mcp-sandbox
+    restart: unless-stopped
+    env_file: .env.sandbox
+    environment:
+      MCP_TRANSPORT: http
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: "8000"
+    ports:
+      - "8001:8000"
+    volumes:
+      - ./data-sandbox:/data

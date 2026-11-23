@@ -1,0 +1,32 @@
+[project]
+name = "zendesk-mcp"
+version = "1.0.0"
+description = "Full-access Model Context Protocol server for Zendesk Support and Help Center"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "mcp>=2.2,<3",
+    "httpx>=0.27",
+    "uvicorn>=0.30",
+    "starlette>=0.37",
+    "python-dotenv>=1.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+zendesk-mcp = "zendesk_mcp.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/zendesk_mcp"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
