@@ -11,7 +11,7 @@ NOW = datetime(2026, 10, 14, 15, 0, tzinfo=timezone.utc)
 
 @pytest.fixture(autouse=True)
 def frozen_now(monkeypatch):
-    for mod in ("periods", "tools.analytics", "tools.reporting", "tools.customers"):
+    for mod in ("periods", "tools.analytics", "tools.reporting", "tools.customers", "tools.operations"):
         monkeypatch.setattr(f"zendesk_mcp.{mod}.utcnow", lambda: NOW)
 
 
@@ -182,3 +182,61 @@ async def test_agent_profile(connect, fake):
     assert r["samples"][0]["reply"] == "Sorry for the trouble, [name]. I'll follow up tomorrow with a fix."
     assert out["open_queue"]["unsolved_total"] == 0
     assert not_agent.is_error and "No agent matches" in not_agent.content[0].text
+
+
+# ----------------------------------------------------------------------------- capacity_forecast
+
+from zendesk_mcp.tools.operations import forecast  # noqa: E402
+
+
+def test_forecast_math():
+    assert forecast([100.0] * 16, 2) == [{"expected": 100.0, "low": 100.0, "high": 100.0}] * 2
+    rising = forecast([80.0 + 2 * i for i in range(16)], 3)
+    assert [f["expected"] for f in rising] == [112.0, 114.0, 116.0]  # the line continued
+    noisy = forecast([50, 70, 40, 60, 55, 65, 45, 60, 50, 62], 1)[0]
+    assert noisy["low"] < noisy["expected"] < noisy["high"]
+
+
+async def test_capacity_forecast(connect, fake):
+    def count(req):
+        q = req.url.params["query"]
+        if "assignee:8" in q:
+            return {"count": 200}
+        if "assignee:9" in q:
+            return {"count": 160}
+        if "status<solved" in q:
+            return {"count": 50}
+        return {"count": 100 if "created>=" in q else 90}
+
+    fake.on("GET", "/api/v2/search/count", count)
+    fake.on("GET", "/api/v2/users", {"users": [u for u in USERS if u["role"] == "agent"], "meta": {"has_more": False}})
+    async with connect() as cl:
+        out = data(await cl.call_tool("capacity_forecast", {"history_weeks": 8, "horizon_weeks": 3,
+                                                            "heatmap_weeks": 0}))
+    s = out["summary"]
+    assert (s["new_tickets_per_week_recent"], s["solved_per_week_recent"], s["backlog_now"]) == (100.0, 90.0, 50)
+    assert s["trend"] == "flat" and s["backlog_in_3_weeks"] == 80
+    assert s["weeks_demand_above_capacity"] == ["2026-10-12", "2026-10-19", "2026-10-26"]
+    assert [w["week_starting"] for w in out["history"]][:2] == ["2026-08-17", "2026-08-24"]
+    assert out["history"][-1] == {"week_starting": "2026-10-05", "created": 100, "solved": 90, "net": 10}
+    f = out["forecast"][0]
+    assert (f["backlog_end_expected"], f["utilisation_pct"], f["flag"]) == (60, 111.1, "demand above capacity")
+    assert out["agents"]["per_agent"] == [{"agent": "Alice Smith", "solved_per_week": 50.0},
+                                          {"agent": "Bob Jones", "solved_per_week": 40.0}]
+    assert s["tickets_per_agent_per_week_needed"] == 50.0
+    assert "busiest_slots" not in out
+    count_calls = [c for c in fake.calls if c.url.path.endswith("/search/count")]
+    assert len(count_calls) == 8 * 2 + 1 + 2  # weekly created+solved, backlog, per agent
+
+
+async def test_capacity_forecast_busiest_slots(connect, fake):
+    install(fake)
+    fake.on("GET", "/api/v2/search/count", {"count": 4})
+    fake.on("GET", "/api/v2/search/export", {"results": TICKETS, "meta": {"has_more": False}})
+    async with connect() as cl:
+        out = data(await cl.call_tool("capacity_forecast", {"history_weeks": 6, "per_agent": False,
+                                                            "time_zone": "America/Los_Angeles"}))
+    slots = out["busiest_slots"]
+    assert slots["peaks"][0]["hour"] == 3 and slots["peaks"][0]["tickets"] == 1  # 10:00Z = 03:00 PDT
+    assert {r["hour"] for r in slots["frt_median_by_hour"]} == {3}
+    assert "agents" not in out
