@@ -115,3 +115,91 @@ async def test_promise_tracker_team_level(connect, fake):
         out = data(await cl.call_tool("promise_tracker", {"team_level": True, "include_pending": False}))
     assert "by_agent" not in out and all("agent" not in p for p in out["promises"])
     assert all(p["status"] != "pending" for p in out["promises"])
+
+
+# ----------------------------------------------------------------------------- ticket_brief
+
+def A(at, author, events, via=None):
+    return {"id": hash(at) % 10000, "created_at": at, "author_id": author, "via": via or {"channel": "web"},
+            "events": events}
+
+
+TRIGGER = {"channel": "rule", "source": {"rel": "trigger", "from": {"id": 55, "title": "Route SSO to Tier 2"}}}
+AUDITS = [
+    A("2026-10-12T16:00:00Z", 7, [{"type": "Create", "field_name": "group_id", "value": "3"},
+                                  {"type": "Create", "field_name": "status", "value": "new"},
+                                  {"type": "Change", "field_name": "group_id", "value": "4", "previous_value": "3",
+                                   "via": TRIGGER}]),
+    A("2026-10-12T17:00:00Z", 8, [{"type": "Change", "field_name": "assignee_id", "value": "8", "previous_value": None},
+                                  {"type": "Change", "field_name": "status", "value": "open", "previous_value": "new"},
+                                  {"type": "AgentMacroReference", "macro_id": "77", "macro_title": "Ask for logs"},
+                                  {"type": "Change", "field_name": "priority", "value": "high",
+                                   "previous_value": "normal"}]),
+]
+BRIEF_T = {**TICKETS[0], "type": "incident", "problem_id": 900, "group_id": 4, "priority": "high", "tags": ["sso"],
+           "via": {"channel": "email"}, "custom_fields": [{"id": 100, "value": "cat_sso"}]}
+
+
+def install_brief(fake):
+    install(fake)
+
+    def search(req):
+        q = req.url.params["query"]
+        if "requester:7" in q:
+            return [BRIEF_T, TICKETS[3]]
+        if "organization:50" in q:
+            return [BRIEF_T, TICKETS[1]]
+        return []
+
+    fake.on("GET", "/api/v2/search/count", lambda r: {"count": len(search(r))})
+    fake.on("GET", "/api/v2/search/export", lambda r: {"results": search(r), "meta": {"has_more": False}})
+    fake.on("GET", "/api/v2/tickets/1", {"ticket": BRIEF_T, "users": USERS, "groups": [
+        {"id": 3, "name": "Tier 1"}, {"id": 4, "name": "Tier 2"}], "organizations": [{"id": 50, "name": "Acme"}]})
+    fake.on("GET", "/api/v2/tickets/900", {"ticket": {"id": 900, "subject": "SSO outage", "status": "open",
+                                                      "priority": "urgent", "created_at": "2026-10-11T00:00:00Z"}})
+    fake.on("GET", "/api/v2/tickets/1/audits", {"audits": AUDITS, "meta": {"has_more": False}})
+    fake.on("GET", "/api/v2/tickets/1/metrics", {"ticket_metric": {"replies": 1, "reopens": 0,
+                                                                   "reply_time_in_minutes": {"calendar": 60}}})
+    fake.on("GET", "/api/v2/ticket_fields", {"ticket_fields": [
+        {"id": 100, "title": "Product area", "type": "tagger", "active": True,
+         "custom_field_options": [{"name": "SSO", "value": "cat_sso"}]}], "meta": {"has_more": False}})
+
+
+async def test_ticket_brief(connect, fake):
+    install_brief(fake)
+    async with connect() as cl:
+        out = data(await cl.call_tool("ticket_brief", {"ticket_id": 1}))
+    assert out["headline"].startswith("#1 Export failing for [name] — high, open, open 13.6 days, 1 agent replies")
+    assert "1 group transfer(s)" in out["headline"] and "customer waiting 21.0h" in out["headline"]
+    assert "1 overdue promise(s)" in out["headline"]
+    tk = out["ticket"]
+    assert (tk["organization"], tk["group"], tk["assignee"], tk["fields"]) == ("Acme", "Tier 2", "Alice Smith",
+                                                                             {"Product area": "SSO"})
+    assert "requester" not in tk  # redacted by default
+    assert out["state_now"] == {"waiting_on": "us", "since": "2026-10-13T18:00:00+00:00", "hours": 21.0}
+    n = out["numbers"]
+    assert (n["group_transfers"], n["assignee_changes"], n["internal_notes"], n["customer_messages"]) == (1, 1, 1, 2)
+    assert n["customer_wait_each_time_min"]["n"] == 1 and n["total_customer_wait_hours"] == 1.0
+    events = [(e["event"], e.get("change"), e.get("by")) for e in out["timeline"]]
+    assert ("group changed", "Tier 1 → Tier 2", "trigger 'Route SSO to Tier 2'") in events
+    assert ("macro applied", "Ask for logs", "Alice Smith") in events
+    assert ("assignee changed", "(unassigned) → Alice Smith", "Alice Smith") in events
+    assert ("internal note", None, "Bob Jones") in events
+    assert any(e.get("text") == "Any update? Call me on [number]" and e.get("tone") == "neutral"
+               for e in out["timeline"])
+    assert out["promises"][0]["status"] == "overdue" and out["promises"][0]["by"] == "Alice Smith"
+    rel = out["related"]
+    assert rel["problem"]["subject"] == "SSO outage"
+    assert [x["id"] for x in rel["requester_other_open"]] == [4]
+    assert rel["organization_other_open"]["count"] == 1
+
+
+async def test_ticket_brief_options(connect, fake):
+    install_brief(fake)
+    async with connect() as cl:
+        out = data(await cl.call_tool("ticket_brief", {"ticket_id": 1, "include_internal": False, "redact": False,
+                                                       "timeline_limit": 10}))
+        missing = await cl.call_tool("ticket_brief", {"ticket_id": 404})
+    assert out["ticket"]["requester"] == "Jane Doe"
+    assert not any(e["event"] == "internal note" for e in out["timeline"])
+    assert missing.is_error and "Ticket 404" in missing.content[0].text
