@@ -8,7 +8,7 @@ from mcp.server.mcpserver import MCPServer
 from .client import ZendeskClient
 from .config import Settings
 from .toolkit import Toolkit
-from .tools import (admin, advanced, analytics, blueprint, changes, docs, helpcenter, people, reporting,
+from .tools import (admin, advanced, analytics, blueprint, changes, customers, docs, helpcenter, people, reporting,
                     resources, search, tickets)
 
 INSTRUCTIONS = """Full-access Zendesk Support + Help Center server.
@@ -26,7 +26,10 @@ pass business_hours=true for business-hours figures.
 Reports/decks: support_report gathers everything for a review deck in one call (scorecard vs previous period and
 targets, trends, topics, CSAT quotes, SLA, heatmap, issues, backlog, Help Center gaps, definitions, slide outline).
 Drill down with kpi_trends, ticket_topics, sample_ticket_text (free-text themes), csat_feedback, volume_heatmap,
-top_issues, help_center_report. Goals live in report_targets. Periods accept shorthands like last_quarter or 2026-Q3.
+top_issues, help_center_report. Goals live in report_targets.
+Customers: customer_profile(organization=...) profiles one organization — volume, response/resolution performance vs
+previous period and all customers, backlog, SLA, hardest tickets and sentiment (CSAT, AI sentiment fields, message
+tone with excerpts). Lead with its `signals`; treat conversation tone as a heuristic and check the excerpts. Periods accept shorthands like last_quarter or 2026-Q3.
 For company-wide audiences keep team_level=true and redact=true (the defaults).
 Administration: list_agents, provision_agents, offboard_agent (dry run by default); rule_definitions before building
 triggers/views/macros/automations; preview_view to test view conditions; reorder; find_references before renaming,
@@ -58,7 +61,7 @@ def build_server(settings: Settings, transport: httpx.AsyncBaseTransport | None 
     if on("core"):
         modules += [search, tickets, people, resources, helpcenter, advanced]
     if on("analytics"):
-        modules += [analytics, reporting]
+        modules += [analytics, reporting, customers]
     if on("admin"):
         modules += [admin, blueprint, docs]
     if on("core") or on("admin"):
