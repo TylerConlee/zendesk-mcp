@@ -293,7 +293,9 @@ async def compute_backlog(zd: ZendeskClient, filter: str | None, group_by: str, 
     return result
 
 
-async def compute_sla(zd: ZendeskClient, p: Period, lookback_days: int = 14, max_pages: int = 30) -> dict[str, Any]:
+async def compute_sla(zd: ZendeskClient, p: Period, lookback_days: int = 14, max_pages: int = 30,
+                      ticket_ids: set[int] | None = None) -> dict[str, Any]:
+    """SLA achievement from ticket metric events. `ticket_ids` limits it to those tickets (e.g. one customer's)."""
     ws = datetime.combine(p.start, datetime.min.time(), timezone.utc)
     we = datetime.combine(p.end, datetime.min.time(), timezone.utc)
     cursor = int((ws - timedelta(days=lookback_days)).timestamp())
@@ -332,7 +334,7 @@ async def compute_sla(zd: ZendeskClient, p: Period, lookback_days: int = 14, max
     rows: dict[tuple[str, str], Counter] = defaultdict(Counter)
     active: list[dict] = []
     for (ticket_id, metric, _), st in inst.items():
-        if not st["policy"]:
+        if not st["policy"] or (ticket_ids is not None and ticket_id not in ticket_ids):
             continue
         row = rows[(st["policy"], metric)]
         fulfilled = st["fulfill_at"] is not None and ws <= st["fulfill_at"] < we

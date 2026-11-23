@@ -2,7 +2,7 @@
 
 A self-hosted [Model Context Protocol](https://modelcontextprotocol.io) server that gives an LLM full access to a Zendesk instance — Support, Help Center, and anything else under `/api/v2` — using your own API credentials. No third-party relay, no usage restrictions beyond the access mode you choose.
 
-- **61 tools**: curated tools for the common work (tickets, search, users, articles, macros), support analytics, presentation-ready reporting, full administration (agents, rules, settings, configuration-as-code rollouts), generic CRUD over 52 resource types, and a raw `api_request` escape hatch for every other endpoint.
+- **62 tools**: curated tools for the common work (tickets, search, users, articles, macros), support analytics, presentation-ready reporting, customer profiles, full administration (agents, rules, settings, configuration-as-code rollouts), generic CRUD over 52 resource types, and a raw `api_request` escape hatch for every other endpoint.
 - **Safe administration**: every write is journaled with the object's prior state and can be reverted; configuration rollouts are planned (a reviewable diff) before they're applied; configuration can be snapshotted, diffed and documented in plain language.
 - **Deck-ready reporting**: one call (`support_report`) returns a scorecard vs last period and vs your targets, trends, contact drivers, customer quotes, SLA, a staffing heatmap, biggest issues, backlog and Help Center gaps — redacted and team-level by default for company-wide audiences.
 - **Support metrics built in**: KPIs from Zendesk's own ticket metrics, plus the time between *every* customer message and agent reply (not just the first), in calendar or business hours from your Zendesk schedules.
@@ -22,6 +22,7 @@ A self-hosted [Model Context Protocol](https://modelcontextprotocol.io) server t
 | Help Center | `search_articles`, `get_article`, `create_article`, `update_article` |
 | Analytics | `support_kpis`, `reply_time_report`, `ticket_reply_times`, `backlog_report`, `sla_report` |
 | Reporting | `support_report`, `kpi_trends`, `ticket_topics`, `sample_ticket_text`, `csat_feedback`, `volume_heatmap`, `top_issues`, `help_center_report`, `report_targets` |
+| Customers | `customer_profile` |
 | Administration | `list_agents`, `provision_agents`, `offboard_agent`, `rule_definitions`, `preview_view`, `reorder`, `find_references`, `account_settings`, `document_config` |
 | Rollouts & safety | `blueprint_export`, `blueprint_plan`, `blueprint_apply`, `config_snapshot`, `snapshot_diff`, `list_changes`, `revert_change` |
 | Advanced | `api_request`, `incremental_export`, `upload_attachment`, `download_attachment` |
@@ -85,6 +86,26 @@ Drill-down tools for individual slides: `kpi_trends` (any metric over time, spli
 **Charts and spreadsheets**: chart data comes back as tidy rows. Add `csv: "inline"` to get CSV text, or `csv: "files"` to write CSVs under `ZENDESK_FILE_ROOT/reports/`.
 
 **Cost and speed**: about one API call per 100 tickets per period, plus a handful for SLA, CSAT and Help Center — ~250 calls for a quarter with 6,000 tickets (compared against the previous quarter), so one to two minutes on most plans' rate limits. Results are cached for 10 minutes, so follow-up drill-downs on the same period are fast. `reply_gap_sample: N` adds conversation-level reply gaps for N sampled tickets at one call each.
+
+## Customer profiles
+
+Ask about one customer and let Claude call `customer_profile`:
+
+> "Give me a profile of Acme Corp for their QBR — last quarter, and how they compare to everyone else."
+
+Pass an organization name (exact, prefix or keywords) or ID. If a name matches several organizations, the tool lists them with IDs instead of guessing. Default period: last 90 days, compared with the 90 days before.
+
+| Section | What's in it |
+|---|---|
+| `customer` | Account facts: customer since, tags, domains, custom organization fields (labelled), users and all-time ticket count. |
+| `signals` | Risks, watch-outs and positives worth leading with — volume spikes, CSAT drops, slower replies than other customers, reopens, open urgent tickets, stale backlog, SLA misses, frustration in conversations. |
+| `volume` | Tickets vs the previous period, share of all tickets, weekly/monthly trend, channel/priority/type/status mix, contact drivers (rising and falling topics), top contacts. |
+| `performance` | Scorecard — first reply, resolution, customer wait, one-touch, reopens, CSAT — vs the previous period and vs all customers (`better`/`worse`), plus SLA achievement on their tickets. |
+| `backlog_now` | Their unsolved tickets right now: by status, age, stale, unassigned, oldest. |
+| `challenging_tickets` | Their hardest tickets, ranked by replies, reopens, transfers, bad CSAT, priority and time open, each with the reasons in words and a link. |
+| `sentiment` | CSAT score, bad-rating reasons and comments; any AI sentiment field or tags already in Zendesk; and the tone of their own messages in a sample of conversations (frustration, chasing and churn language vs thanks and praise), with excerpts and the reply pace both ways. |
+
+Conversation tone is a transparent keyword heuristic, not a model — excerpts come back so Claude can read the actual words before describing the relationship. `conversations` controls how many tickets are read (one API call each; the hardest tickets first). `benchmark=false` skips the all-customer comparison on very large accounts. Like the reports, text is redacted and agent names left out by default; set `redact=false` to see contact names and `team_level=false` for assignees.
 
 ## Administering Zendesk
 
@@ -299,6 +320,8 @@ Separately from the mode, note that merges, bulk updates and public replies are 
 - "Build a Q3 support review deck for the whole company, with customer quotes and our biggest issues."
 - "What were the top 5 rising contact reasons this month vs last, and do we have Help Center articles for them?"
 - "When should we add evening coverage? Show the heatmap in Pacific time."
+- "Profile Acme Corp: how much do they contact us, how fast are we for them compared with other customers, and how do they feel about us?"
+- "Which of Globex's tickets this quarter were the hardest, and what went wrong on each?"
 - "Document our current Zendesk configuration and list anything that looks broken or unused."
 - "Here's our new architecture plan. Snapshot the config, turn the plan into a blueprint, and show me the plan before changing anything."
 - "Add these five agents to Tier 1 with the Light Agent role." / "Offboard jane@acme.com and move her tickets to Tier 2."
@@ -314,7 +337,7 @@ Separately from the mode, note that merges, bulk updates and public replies are 
 
 The suite runs every tool against a fake Zendesk API (no network) and starts a real HTTP server to check auth.
 
-Layout: `client.py` (auth, access enforcement, retries, pagination, journaling), `journal.py` (change journal), `formatting.py` (slimming, size limits, CSV), `metrics.py` (stats, business hours, reply-gap engine), `periods.py`, `privacy.py` (redaction), `targets.py` (definitions, deltas, RAG), `tools/admin.py`, `tools/blueprint.py` (plan/apply engine), `tools/changes.py` (snapshots, revert), `tools/docs.py` (configuration documentation), `tools/*.py` (one module per area), `server.py` (wiring), `__main__.py` (CLI and HTTP auth). To add a resource type, add a line to `RESOURCES` in `tools/resources.py`.
+Layout: `client.py` (auth, access enforcement, retries, pagination, journaling), `journal.py` (change journal), `formatting.py` (slimming, size limits, CSV), `metrics.py` (stats, business hours, reply-gap engine), `periods.py`, `privacy.py` (redaction), `targets.py` (definitions, deltas, RAG), `tools/admin.py`, `tools/blueprint.py` (plan/apply engine), `tools/changes.py` (snapshots, revert), `tools/docs.py` (configuration documentation), `tools/customers.py` (customer profiles), `tools/*.py` (one module per area), `server.py` (wiring), `__main__.py` (CLI and HTTP auth). To add a resource type, add a line to `RESOURCES` in `tools/resources.py`.
 
 ## License
 
