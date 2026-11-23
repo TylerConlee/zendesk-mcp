@@ -8,8 +8,8 @@ from mcp.server.mcpserver import MCPServer
 from .client import ZendeskClient
 from .config import Settings
 from .toolkit import Toolkit
-from .tools import (admin, advanced, analytics, blueprint, changes, customers, docs, helpcenter, people, reporting,
-                    resources, search, tickets)
+from .tools import (accounts, admin, advanced, analytics, blueprint, changes, customers, docs, helpcenter, people,
+                    reporting, resources, search, tickets)
 
 INSTRUCTIONS = """Full-access Zendesk Support + Help Center server.
 
@@ -61,7 +61,7 @@ def build_server(settings: Settings, transport: httpx.AsyncBaseTransport | None 
     if on("core"):
         modules += [search, tickets, people, resources, helpcenter, advanced]
     if on("analytics"):
-        modules += [analytics, reporting, customers]
+        modules += [analytics, reporting, customers, accounts]
     if on("admin"):
         modules += [admin, blueprint, docs]
     if on("core") or on("admin"):
