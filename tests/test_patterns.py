@@ -84,3 +84,77 @@ async def test_emerging_issues_thresholds(connect, fake):
     issues = {i["issue"].split(",")[0] for i in solo["issues"]}
     assert "invoice" in issues  # single-customer spike shows when allowed
     assert all(c["customer"].startswith("Customer ") for i in solo["issues"] for c in i["customers"])
+
+
+# ----------------------------------------------------------------------------- deflection_finder
+
+from zendesk_mcp.tools.patterns import answer_similarity  # noqa: E402
+
+PW = ["Reset password", "How to reset password", "Password reset not working", "Can't reset my password",
+      "Reset password link", "Forgot password reset"]
+CSV = ["Export to CSV fails", "CSV export error", "Export CSV broken", "Cannot export CSV file", "CSV export failing"]
+OTHER = ["Billing invoice question", "Add new user seats", "API rate limit exceeded"]
+SOLVED = (
+    [T(300 + i, "2026-09-05T10:00:00Z", 50 + i, s, "Hi, I need to reset my password for my account. Thanks, Jane",
+       status="solved") for i, s in enumerate(PW)]
+    + [T(400 + i, "2026-09-06T10:00:00Z", 60 + i, s, "When I export the project to CSV it fails with an error.",
+         status="solved") for i, s in enumerate(CSV)]
+    + [T(500 + i, "2026-09-07T10:00:00Z", 70, s, "Quick question about our plan.", status="solved")
+       for i, s in enumerate(OTHER)]
+)
+SOLVED[0]["via"] = {"channel": "web"}
+PW_REPLY = "You can reset your password from Settings > Security > Reset password. Here's the link."
+CSV_REPLIES = ["Could you send the browser console log?", "Which Label version are you on? Try a smaller project.",
+               "This is a known bug in exports with images; engineering is on it.",
+               "Please clear your cache and retry the download.", "Can you share the project ID and export format?"]
+
+
+def install_solved(fake):
+    ALL = {t["id"]: t for t in SOLVED}
+    fake.on("GET", "/api/v2/search/count", {"count": len(SOLVED)})
+    fake.on("GET", "/api/v2/search/export", lambda r: {"results": SOLVED if "solved>=2026-09-01" in
+                                                       r.url.params["query"] else [], "meta": {"has_more": False}})
+    fake.on("GET", "/api/v2/tickets/show_many", lambda r: {
+        "tickets": [ALL[int(i)] for i in r.url.params["ids"].split(",")], "users": USERS, "groups": [],
+        "metric_sets": [{"ticket_id": int(i), "replies": 1 if int(i) < 400 else 3,
+                         "full_resolution_time_in_minutes": {"calendar": 120}} for i in r.url.params["ids"].split(",")]})
+    for t in SOLVED:
+        reply = PW_REPLY if t["id"] < 400 else CSV_REPLIES[(t["id"] - 400) % 5] if t["id"] < 500 else "Sure."
+        fake.on("GET", f"/api/v2/tickets/{t['id']}/comments", {"comments": [
+            {"id": 1, "author_id": 7, "plain_body": t["description"], "public": True},
+            {"id": 2, "author_id": 8, "plain_body": "Internal: easy one", "public": False},
+            {"id": 3, "author_id": 8, "plain_body": reply + "\n\nBest,\nAlice", "public": True}],
+            "users": USERS + [{"id": 8, "name": "Alice Smith", "role": "agent"}], "meta": {"has_more": False}})
+    fake.on("GET", "/api/v2/help_center/articles/search", lambda r: {
+        "results": [{"title": "Resetting your password", "html_url": "https://help.x/1"}], "count": 1}
+        if "password" in r.url.params["query"] else {"results": [], "count": 0})
+    fake.on("GET", "/api/v2/macros/search", lambda r: {"macros": [{"title": "CSV export troubleshooting"}]}
+            if "csv" in r.url.params["query"].lower() or "export" in r.url.params["query"].lower() else {"macros": []})
+
+
+def test_answer_similarity():
+    sim, typical = answer_similarity([PW_REPLY, PW_REPLY + " Thanks!", "Totally different answer about billing"])
+    assert 0.3 < sim < 1 and typical in (0, 1)
+    assert answer_similarity(["one"]) == (None, 0) and answer_similarity([]) == (None, None)
+
+
+async def test_deflection_finder(connect, fake):
+    install_solved(fake)
+    async with connect() as cl:
+        out = data(await cl.call_tool("deflection_finder", {"period": "2026-09"}))
+    groups = out["groups"]
+    assert [g["tickets"] for g in groups] == [5, 6]  # CSV first: 15 agent replies vs 6
+    csv, pw = groups
+    assert csv["agent_replies_total"] == 15 and csv["replies_avg"] == 3.0
+    assert csv["answer_consistency"]["same_answer"] is False
+    assert csv["matching_macros"] == ["CSV export troubleshooting"]
+    assert any("Answers vary" in s for s in csv["suggestions"])
+    assert any("3.0 agent replies" in s for s in csv["suggestions"])
+    assert pw["one_touch_pct"] == 100.0 and pw["answer_consistency"]["same_answer"] is True
+    assert pw["typical_reply"].startswith("You can reset your password from Settings")
+    assert "Alice" not in pw["typical_reply"]  # sign-off stripped
+    assert pw["help_center_match"]["title"] == "Resetting your password"
+    assert pw["suggestions"][0].startswith("Agents give the same answer") and "Resetting your password" in \
+        pw["suggestions"][1]
+    assert "password" in pw["key_terms"] and "jane" not in pw["key_terms"]
+    assert out["summary"]["groups_found"] == 2 and out["summary"]["tickets_in_shown_groups"] == 11
