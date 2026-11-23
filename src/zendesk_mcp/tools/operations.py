@@ -6,8 +6,9 @@ import json
 import random
 import re
 from collections import Counter, defaultdict
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
+from zoneinfo import ZoneInfo
 
 from pydantic import Field
 
@@ -15,8 +16,12 @@ from ..audits import audits_for, group_path, minutes_between
 from ..client import ZendeskError
 from ..metrics import parse_ts, rate, summarize, utcnow
 from ..periods import PERIOD_HELP, resolve_period
+from ..privacy import Redactor, no_redact
+from ..targets import METRICS, compare, definitions
 from ..toolkit import Toolkit
-from .analytics import _compact, _kpis, load_dataset
+from .analytics import _compact, _gather, _kpis, compute_backlog, load_dataset
+from .customers import difficulty, score_message, tone
+from .followups import AGENT_ROLES, track_promises
 
 PeriodArg = Annotated[str | None, Field(description=PERIOD_HELP + " Default: last_30_days.")]
 Start = Annotated[str | None, Field(description="Start date YYYY-MM-DD (inclusive). Overrides period.")]
@@ -55,6 +60,34 @@ def _mover(by: dict, users: dict[int, dict], team_level: bool) -> str:
     if kind == "user":
         return "agent" if team_level else f"agent: {users.get(by.get('id'), {}).get('name') or by.get('id')}"
     return kind or "unknown"
+
+
+EMPATHY = re.compile(r"\b(?:sorry|apolog\w*|i understand|understandabl\w*|appreciate your patience|thank(?:s| you) for "
+                     r"(?:your )?(?:patience|waiting|bearing)|frustrat\w*)", re.I)
+CARD = ["tickets_solved", "frt_median_min", "frt_median_business_min", "full_resolution_median_min",
+        "requester_wait_median_min", "one_touch_pct", "reopened_pct", "csat_pct"]
+
+
+async def resolve_agent(zd, ref: str) -> dict[str, Any]:
+    ref = (ref or "").strip()
+    if not ref:
+        raise ZendeskError("Provide an agent name, email or ID.")
+    if ref.isdigit():
+        u = (await zd.get(f"users/{ref}"))["user"]
+    else:
+        res = (await zd.get("users/search", query=ref)).get("users") or []
+        staff = [u for u in res if u.get("role") in AGENT_ROLES]
+        exact = [u for u in staff if ref.casefold() in ((u.get("name") or "").casefold(), (u.get("email") or "").casefold())]
+        pool = exact or staff
+        if not pool:
+            raise ZendeskError(f"No agent matches {ref!r}.")
+        if len(pool) > 1:
+            listed = "; ".join(f"{u.get('name')} (id {u['id']})" for u in pool[:10])
+            raise ZendeskError(f"{ref!r} matches {len(pool)} agents: {listed}. Call again with the ID.")
+        u = pool[0]
+    if u.get("role") not in AGENT_ROLES:
+        raise ZendeskError(f"{u.get('name')} is an {u.get('role')}, not an agent.")
+    return u
 
 
 def register(tk: Toolkit) -> None:
@@ -272,3 +305,146 @@ def register(tk: Toolkit) -> None:
         if not team_level:
             result["by_agent"] = [{"agent": a, "macro_uses": n} for a, n in by_agent.most_common(25)]
         return tk.out(result)
+
+    @tk.tool("read", title="Agent profile")
+    async def agent_profile(
+        agent: Annotated[str, Field(description="Agent name, email or user ID.")],
+        period: PeriodArg = None,
+        start: Start = None,
+        end: End = None,
+        date_field: Annotated[str, Field(pattern="^(solved|created|updated)$", description="Count tickets the agent "
+                                         "solved (default), or that were created/updated, in the period.")] = "solved",
+        compare_previous: bool = True,
+        benchmark: Annotated[bool, Field(description="Compare with the whole team's tickets in the same period.")] = True,
+        challenging: Annotated[int, Field(ge=0, le=20)] = 5,
+        reply_samples: Annotated[int, Field(ge=0, le=30, description="Tickets whose conversation is read to quote "
+                                            "the agent's replies (1 API call each).")] = 6,
+        redact: Annotated[bool, Field(description="Strip customer names, emails, links and long numbers from text.")] = True,
+        max_tickets: Annotated[int, Field(ge=1, le=50000)] = 5000,
+    ) -> str:
+        """One agent's work for a 1:1 or coaching conversation: tickets and share of the team's volume, a
+        scorecard (first reply, resolution, customer wait, one-touch, reopens, CSAT) vs their previous period and
+        vs the team, strengths and focus areas, their most challenging tickets, CSAT comments, their open queue
+        (stale and oldest), groups, and a sample of their actual replies with reply length, empathy language and
+        promises kept. Meant for the agent's manager — not for company-wide sharing."""
+        u = await resolve_agent(tk.zd, agent)
+        uid = u["id"]
+        p = resolve_period(period, start, end)
+        scope = f"assignee:{uid}"
+        jobs: dict[str, Any] = {"ds": load_dataset(tk, p, date_field, scope, max_tickets),
+                                "backlog": compute_backlog(tk.zd, scope, "none", 7, 2000),
+                                "memberships": tk.zd.paginate(f"users/{uid}/group_memberships", "group_memberships",
+                                                              limit=200),
+                                "groups": _groups(tk)}
+        if compare_previous:
+            jobs["prev"] = load_dataset(tk, p.previous(), date_field, scope, max_tickets)
+        if benchmark:
+            jobs["team"] = load_dataset(tk, p, date_field, None, 20000)
+        done = dict(zip(jobs, await asyncio.gather(*jobs.values())))
+        ds = done["ds"]
+        mine = [t for t in ds.tickets if t.get("assignee_id") == uid] or ds.tickets
+        prev = done.get("prev")
+        team = done.get("team")
+        now = utcnow()
+        names = [x.get("name") for x in ds.users.values() if x.get("role") == "end-user"]
+        red = Redactor(n for n in names if n) if redact else no_redact
+
+        def vals(ts: list[dict], metrics: dict) -> dict[str, Any]:
+            k = _kpis(ts, metrics)
+            c = _compact(k)
+            return {"tickets_solved": c["solved"], "frt_median_min": c["frt_median_min"],
+                    "frt_median_business_min": c["frt_median_business_min"],
+                    "full_resolution_median_min": c["full_resolution_median_min"],
+                    "requester_wait_median_min": k["requester_wait_time_min"]["calendar"].get("median"),
+                    "one_touch_pct": c["one_touch_pct"], "reopened_pct": c["reopened_pct"], "csat_pct": c["csat_pct"]}
+
+        cur = vals(mine, ds.metrics)
+        pv = vals([t for t in prev.tickets if t.get("assignee_id") == uid] or prev.tickets, prev.metrics) if prev else {}
+        tv = vals(team.tickets, team.metrics) if team else {}
+        card = []
+        strengths, focus = [], []
+        for key in CARD:
+            row = {"metric": key, "label": METRICS[key]["label"], "unit": METRICS[key]["unit"],
+                   **compare(key, cur[key], pv.get(key))}
+            if team and key != "tickets_solved":
+                row["team"] = tv.get(key)
+                vs = compare(key, cur[key], tv.get(key))
+                if vs.get("trend") in ("improved", "worsened") and abs(vs.get("change_pct") or 0) >= 10:
+                    row["vs_team"] = "better" if vs["trend"] == "improved" else "worse"
+                    (strengths if vs["trend"] == "improved" else focus).append(
+                        f"{METRICS[key]['label']}: {cur[key]} vs team {tv.get(key)}")
+            card.append(row)
+
+        hard = sorted(((difficulty(t, ds.metrics.get(t["id"]), now), t) for t in mine), key=lambda x: -x[0][0])
+        hard = [(s, why, t) for (s, why), t in hard if s > 0][:challenging]
+        url = f"https://{tk.settings.host}/agent/tickets/"
+        rated = [t for t in sorted(mine, key=lambda t: t.get("updated_at") or "", reverse=True)
+                 if (t.get("satisfaction_rating") or {}).get("comment")]
+
+        pick, seen = [], set()
+        for t in [t for _, _, t in hard] + sorted(mine, key=lambda t: t.get("updated_at") or "", reverse=True):
+            if t["id"] not in seen and len(pick) < reply_samples:
+                seen.add(t["id"])
+                pick.append(t)
+
+        async def convo(t: dict):
+            try:
+                page = await tk.zd.paginate(f"tickets/{t['id']}/comments", "comments", params={"include": "users"},
+                                            limit=500)
+            except ZendeskError:
+                return t, [], {}
+            return t, page["comments"], {x["id"]: x.get("role") for x in page.get("users", [])}
+
+        convs = await _gather([(lambda t=t: convo(t)) for t in pick])
+        lengths, empathic, replies_n, quotes, promises, cust_tone = [], 0, 0, [], [], Counter()
+        for t, comments, roles in convs:
+            own = [c for c in comments if c.get("author_id") == uid and c.get("public", True)]
+            for c in own:
+                text = (c.get("plain_body") or c.get("body") or "").strip()
+                replies_n += 1
+                lengths.append(len(text.split()))
+                empathic += bool(EMPATHY.search(text))
+            if own:
+                text = re.sub(r"\s+", " ", own[-1].get("plain_body") or own[-1].get("body") or "")
+                quotes.append({"ticket_id": t["id"], "subject": red(t.get("subject")), "reply": red(text[:500])})
+            promises += track_promises(t, comments, roles, ZoneInfo("UTC"), now,
+                                       datetime.combine(p.start, datetime.min.time(), timezone.utc))
+            for c in comments:
+                if roles.get(c.get("author_id")) == "end-user" and c.get("public", True):
+                    s = score_message(c.get("plain_body") or c.get("body") or "")
+                    cust_tone[tone(s["negative"], s["positive"])] += 1
+        mine_promises = [x for x in promises if x.get("author_id") == uid]
+        kept = sum(1 for x in mine_promises if x["status"] == "kept")
+        late = sum(1 for x in mine_promises if x["status"] == "late")
+        bl = done["backlog"]
+        gmap = done["groups"]
+        result: dict[str, Any] = {
+            "agent": {"id": uid, "name": u.get("name"), "role": u.get("role"),
+                      "groups": [gmap.get(m.get("group_id")) for m in done["memberships"]["group_memberships"]],
+                      "last_login_at": u.get("last_login_at")},
+            "scope": {**ds.scope(), "previous_period": prev.period.as_dict() if prev else None,
+                      "generated_at": now.isoformat(), "units": "minutes"},
+            "volume": {"tickets": len(mine), "previous": len([t for t in prev.tickets if t.get("assignee_id") == uid])
+                       if prev else None, "share_of_team_pct": rate(len(mine), len(team.tickets)) if team else None,
+                       "priority": dict(Counter(t.get("priority") or "(none)" for t in mine).most_common()),
+                       "channels": dict(Counter((t.get("via") or {}).get("channel") or "unknown"
+                                                for t in mine).most_common())},
+            "scorecard": card,
+            "strengths": strengths, "focus_areas": focus,
+            "open_queue": {k: bl[k] for k in ("unsolved_total", "by_status", "age_since_created", "stale") if k in bl}
+            | {"oldest": [{**r, "subject": red(r.get("subject"))} for r in bl.get("oldest", [])[:5]]},
+            "challenging_tickets": [{"id": t["id"], "subject": red(t.get("subject")), "status": t.get("status"),
+                                     "difficulty": s, "why": why, "url": url + str(t["id"])} for s, why, t in hard],
+            "csat_comments": [{"ticket_id": t["id"], "score": t["satisfaction_rating"]["score"],
+                               "comment": red(t["satisfaction_rating"]["comment"])} for t in rated[:8]],
+            "replies": {"tickets_read": len(convs), "replies_read": replies_n,
+                        "words_median": summarize(lengths)["median"] if lengths else None,
+                        "empathy_language_pct": rate(empathic, replies_n),
+                        "promises": {"made": len(mine_promises), "kept_on_time": kept, "late": late,
+                                     "overdue": sum(1 for x in mine_promises if x["status"] == "overdue")},
+                        "customer_tone_in_these_tickets": dict(cust_tone),
+                        "samples": quotes},
+            "definitions": definitions(CARD),
+        }
+        return tk.out(result)
+

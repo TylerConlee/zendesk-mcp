@@ -25,7 +25,7 @@ async def test_tool_counts_by_mode(connect):
         nodel = {t.name for t in (await c.list_tools()).tools}
     async with connect(access_mode="read_only") as c:
         ro = {t.name for t in (await c.list_tools()).tools}
-    assert len(full) == 70
+    assert len(full) == 71
     assert full - nodel == {"delete_tickets", "delete_resource"}
     assert "update_ticket" not in ro and "create_resource" not in ro
     assert {"search", "get_ticket", "api_request", "list_resources", "download_attachment", "customer_profile"} <= ro

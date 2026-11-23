@@ -71,9 +71,9 @@ AUDITS = {
 
 def install(fake):
     ALL = {t["id"]: t for t in TICKETS}
-    fake.on("GET", "/api/v2/search/count", lambda r: {"count": len(TICKETS) if "2026-09-01" in r.url.params["query"]
+    fake.on("GET", "/api/v2/search/count", lambda r: {"count": len(TICKETS) if ">=2026-09-01" in r.url.params["query"]
                                                        else 0})
-    fake.on("GET", "/api/v2/search/export", lambda r: {"results": TICKETS if "2026-09-01" in r.url.params["query"]
+    fake.on("GET", "/api/v2/search/export", lambda r: {"results": TICKETS if ">=2026-09-01" in r.url.params["query"]
                                                        else [], "meta": {"has_more": False}})
     fake.on("GET", "/api/v2/tickets/show_many", lambda r: {
         "tickets": [ALL[int(i)] for i in r.url.params["ids"].split(",")], "users": USERS, "groups": GROUPS,
@@ -142,3 +142,43 @@ async def test_macro_report(connect, fake):
     assert all({m["id"] for m in d["macros"]} == {70, 72} for d in out["likely_duplicates"])
     assert out["stale"][0]["title"] == "Old greeting" and out["stale"][0]["personal"] is True
     assert out["by_agent"] == [{"agent": "Alice Smith", "macro_uses": 3}]
+
+
+# ----------------------------------------------------------------------------- agent_profile
+
+def install_agent(fake):
+    install(fake)
+    fake.on("GET", "/api/v2/users/search", lambda r: {"users": [u for u in USERS if r.url.params["query"].lower()
+                                                                 in u["name"].lower()]})
+    fake.on("GET", "/api/v2/users/9/group_memberships", {"group_memberships": [{"group_id": 4}],
+                                                         "meta": {"has_more": False}})
+    fake.on("GET", "/api/v2/tickets/3/comments", {"comments": [
+        {"id": 1, "author_id": 7, "plain_body": "This is still not fixed!! Unacceptable.", "public": True,
+         "created_at": "2026-09-03T10:00:00Z"},
+        {"id": 2, "author_id": 9, "plain_body": "Sorry for the trouble, Jane. I'll follow up tomorrow with a fix.",
+         "public": True, "created_at": "2026-09-03T12:00:00Z"}], "users": USERS, "meta": {"has_more": False}})
+    fake.on("GET", "/api/v2/tickets/4/comments", {"comments": [
+        {"id": 3, "author_id": 7, "plain_body": "Thanks so much, that fixed it!", "public": True,
+         "created_at": "2026-09-04T11:00:00Z"},
+        {"id": 4, "author_id": 9, "plain_body": "Done.", "public": True, "created_at": "2026-09-04T10:30:00Z"}],
+        "users": USERS, "meta": {"has_more": False}})
+
+
+async def test_agent_profile(connect, fake):
+    install_agent(fake)
+    async with connect() as cl:
+        out = data(await cl.call_tool("agent_profile", {"agent": "bob", "period": "2026-09"}))
+        not_agent = await cl.call_tool("agent_profile", {"agent": "jane", "period": "2026-09"})
+    assert out["agent"]["name"] == "Bob Jones" and out["agent"]["groups"] == ["Tier 2"]
+    assert out["volume"]["tickets"] == 2 and out["volume"]["share_of_team_pct"] == 50.0
+    card = {r["metric"]: r for r in out["scorecard"]}
+    assert card["frt_median_min"]["current"] == 55.0 and card["frt_median_min"]["team"] == 25.0
+    assert card["frt_median_min"]["vs_team"] == "worse"
+    assert out["focus_areas"][0].startswith("First reply time (median): 55.0 vs team 25.0")
+    assert out["challenging_tickets"][0]["id"] == 3 and out["challenging_tickets"][0]["why"] == ["4 agent replies"]
+    r = out["replies"]
+    assert (r["tickets_read"], r["replies_read"], r["empathy_language_pct"]) == (2, 2, 50.0)
+    assert r["promises"]["made"] == 1 and r["customer_tone_in_these_tickets"] == {"negative": 1, "positive": 1}
+    assert r["samples"][0]["reply"] == "Sorry for the trouble, [name]. I'll follow up tomorrow with a fix."
+    assert out["open_queue"]["unsolved_total"] == 0
+    assert not_agent.is_error and "No agent matches" in not_agent.content[0].text
