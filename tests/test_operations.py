@@ -106,3 +106,39 @@ async def test_routing_report(connect, fake):
     assert (c["not_transferred"]["frt_median_min"], c["transferred"]["frt_median_min"]) == (15.0, 60.0)
     assert out["most_transferred"][0]["id"] == 3 and out["most_transferred"][0]["hours_to_final_group"] == 24.0
     assert {f["value"]: f["transferred_pct"] for f in out["by_form"]} == {"Default": 33.3, "Billing": 100.0}
+
+
+# ----------------------------------------------------------------------------- macro_report
+
+PW_ACTIONS = [{"field": "comment_value", "value": "Reset it here"}, {"field": "status", "value": "solved"}]
+MACROS = [
+    {"id": 70, "title": "Password reset", "active": True, "usage_30d": 12, "usage_7d": 4, "actions": PW_ACTIONS,
+     "updated_at": "2026-08-01T00:00:00Z", "restriction": None},
+    {"id": 71, "title": "Refund", "active": True, "usage_30d": 3, "usage_7d": 1, "updated_at": "2026-06-01T00:00:00Z",
+     "actions": [{"field": "group_id", "value": "5"}], "restriction": None},
+    {"id": 72, "title": "Password Reset (copy)", "active": True, "usage_30d": 0, "actions": PW_ACTIONS,
+     "updated_at": "2026-08-02T00:00:00Z", "restriction": None},
+    {"id": 73, "title": "Old greeting", "active": True, "usage_30d": 0, "updated_at": "2024-01-01T00:00:00Z",
+     "actions": [{"field": "comment_value", "value": "Hello!"}], "restriction": {"type": "User", "id": 9}},
+    {"id": 74, "title": "Retired", "active": False, "usage_30d": 0, "actions": [], "updated_at": "2023-01-01T00:00:00Z"},
+]
+
+
+async def test_macro_report(connect, fake):
+    install(fake)
+    fake.on("GET", "/api/v2/macros", {"macros": MACROS, "meta": {"has_more": False}})
+    async with connect() as cl:
+        out = data(await cl.call_tool("macro_report", {"period": "2026-09", "min_uses": 1, "team_level": False}))
+    s = out["summary"]
+    assert (s["active"], s["inactive"], s["personal"], s["unused_30d"], s["not_edited_in_365_days"]) == (4, 1, 1, 2, 1)
+    assert s["tickets_with_a_macro_pct"] == 75.0  # 1, 2, 3 had a macro; 4 didn't
+    assert [m["title"] for m in out["most_used_30d"]] == ["Password reset", "Refund"]
+    by = {m["macro"]: m for m in out["outcomes"]["by_macro"]}
+    assert by["Password reset"]["tickets"] == 2 and by["Password reset"]["replies_avg"] == 2.5
+    assert by["Refund"]["flags"] == ["reopened more often", "more back-and-forth than usual"]
+    assert out["outcomes"]["tickets_without_macros"]["tickets"] == 1
+    dup_whys = sorted(d["why"] for d in out["likely_duplicates"])
+    assert dup_whys == ["near-identical titles", "same actions"]
+    assert all({m["id"] for m in d["macros"]} == {70, 72} for d in out["likely_duplicates"])
+    assert out["stale"][0]["title"] == "Old greeting" and out["stale"][0]["personal"] is True
+    assert out["by_agent"] == [{"agent": "Alice Smith", "macro_uses": 3}]

@@ -2,15 +2,18 @@
 used and whether they help), one agent's work for 1:1s, and whether the team will keep up with demand."""
 
 import asyncio
+import json
 import random
+import re
 from collections import Counter, defaultdict
+from datetime import timedelta
 from typing import Annotated, Any
 
 from pydantic import Field
 
 from ..audits import audits_for, group_path, minutes_between
 from ..client import ZendeskError
-from ..metrics import rate, summarize
+from ..metrics import parse_ts, rate, summarize, utcnow
 from ..periods import PERIOD_HELP, resolve_period
 from ..toolkit import Toolkit
 from .analytics import _compact, _kpis, load_dataset
@@ -145,3 +148,127 @@ def register(tk: Toolkit) -> None:
                                   "hours_to_final_group": round((r["to_final_min"] or 0) / 60, 1),
                                   "url": url + str(r["t"]["id"])} for r in worst],
         })
+
+    @tk.tool("read", title="Macro report")
+    async def macro_report(
+        period: PeriodArg = None,
+        start: Start = None,
+        end: End = None,
+        filter: Filter = None,
+        max_tickets_audited: Audited = 300,
+        stale_days: Annotated[int, Field(ge=30, le=1825, description="Active macros not edited in this many days "
+                                         "are listed as stale.")] = 365,
+        min_uses: Annotated[int, Field(ge=1, le=100, description="Uses in the sample before a macro's outcomes "
+                                       "are shown.")] = 3,
+        team_level: Annotated[bool, Field(description="Leave out per-agent macro usage.")] = True,
+        limit: Annotated[int, Field(ge=1, le=200)] = 20,
+        max_tickets: Annotated[int, Field(ge=1, le=50000)] = 20000,
+    ) -> str:
+        """Which macros pull their weight: most used (Zendesk's 7- and 30-day counts), and for a sample of tickets
+        solved in the period, how tickets where each macro was used turned out — CSAT, reopens, agent replies,
+        one-touch, resolution time — compared with tickets where no macro was used. Also lists active macros
+        unused in 30 days, macros not edited in a year, likely duplicates (same actions or near-identical
+        titles), personal vs shared, and (unless team_level) who uses macros. Use it to prune, fix or promote
+        macros; pair with deflection_finder to find macros worth writing."""
+        p = resolve_period(period, start, end)
+        page, ds = await asyncio.gather(
+            tk.zd.paginate("macros", "macros", params={"include": "usage_7d,usage_30d"}, limit=5000),
+            load_dataset(tk, p, "solved", filter, max_tickets))
+        macros = page["macros"]
+        active = [m for m in macros if m.get("active", True)]
+        sample = _sample(ds.tickets, max_tickets_audited)
+        parsed = await audits_for(tk, sample)
+        now = utcnow()
+
+        used_on: dict[Any, list[dict]] = defaultdict(list)
+        by_agent: Counter = Counter()
+        with_macro, without = [], []
+        titles = {m["id"]: m.get("title") for m in macros}
+        for t in sample:
+            pa = parsed.get(t["id"])
+            if pa is None:
+                continue
+            ids = {mc["macro_id"] for mc in pa["macros"]}
+            for mc in pa["macros"]:
+                titles.setdefault(mc["macro_id"], mc.get("title"))
+                by_agent[ds.users.get(mc["by"].get("id"), {}).get("name") or "(unknown)"] += 1
+            for mid in ids:
+                used_on[mid].append(t)
+            (with_macro if ids else without).append(t)
+
+        def outcome(ts: list[dict]) -> dict[str, Any]:
+            k = _compact(_kpis(ts, ds.metrics))
+            reps = [(ds.metrics.get(t["id"]) or {}).get("replies") for t in ts]
+            reps = [r for r in reps if r is not None]
+            return {"tickets": len(ts), "csat_pct": k["csat_pct"], "csat_ratings": k["csat_ratings"],
+                    "reopened_pct": k["reopened_pct"], "one_touch_pct": k["one_touch_pct"],
+                    "replies_avg": round(sum(reps) / len(reps), 1) if reps else None,
+                    "full_resolution_median_min": k["full_resolution_median_min"]}
+
+        base = outcome(without)
+        perf = []
+        for mid, ts in sorted(used_on.items(), key=lambda kv: -len(kv[1])):
+            if len(ts) < min_uses:
+                continue
+            o = outcome(ts)
+            flags = []
+            if o["csat_pct"] is not None and base["csat_pct"] is not None and o["csat_ratings"] >= 3 \
+                    and o["csat_pct"] <= base["csat_pct"] - 10:
+                flags.append("CSAT 10+ pts below tickets without macros")
+            if (o["reopened_pct"] or 0) >= max(15, (base["reopened_pct"] or 0) + 10):
+                flags.append("reopened more often")
+            if (o["replies_avg"] or 0) >= (base["replies_avg"] or 0) + 1:
+                flags.append("more back-and-forth than usual")
+            perf.append({"macro": titles.get(mid) or f"macro {mid}", "id": mid, **o, **({"flags": flags} if flags else {})})
+
+        cutoff = now - timedelta(days=stale_days)
+        unused = sorted((m for m in active if not m.get("usage_30d")), key=lambda m: m.get("updated_at") or "")
+        stale = sorted((m for m in active if (parse_ts(m.get("updated_at")) or now) < cutoff),
+                       key=lambda m: m.get("updated_at") or "")
+
+        def norm_title(s: str | None) -> str:
+            s = re.sub(r"\((?:copy|old|new|v\d+)\)|\bcopy( of)?\b|\bv\d+\b", " ", (s or "").lower())
+            return re.sub(r"[^a-z0-9]+", " ", s).strip()
+
+        def actions_key(m: dict) -> str:
+            acts = sorted((a.get("field") or "", json.dumps(a.get("value"), sort_keys=True)) for a in m.get("actions") or [])
+            return json.dumps(acts)
+
+        dupes = []
+        for key, label in ((actions_key, "same actions"), (lambda m: norm_title(m.get("title")), "near-identical titles")):
+            d: dict[str, list[dict]] = defaultdict(list)
+            for m in active:
+                k = key(m)
+                if k and k != "[]":
+                    d[k].append(m)
+            for ms in d.values():
+                if len(ms) > 1:
+                    dupes.append({"why": label, "macros": [{"id": m["id"], "title": m.get("title"),
+                                                             "usage_30d": m.get("usage_30d") or 0} for m in ms]})
+        brief = lambda m: {"id": m["id"], "title": m.get("title"), "updated_at": m.get("updated_at"),  # noqa: E731
+                           "personal": m.get("restriction") is not None and m["restriction"].get("type") == "User"}
+        n_audited = len(with_macro) + len(without)
+        result: dict[str, Any] = {
+            "scope": {**ds.scope(), "tickets_audited": n_audited, "macros_read": len(macros),
+                      "more_macros": page["has_more"]},
+            "summary": {
+                "active": len(active), "inactive": len(macros) - len(active),
+                "personal": sum(1 for m in active if (m.get("restriction") or {}).get("type") == "User"),
+                "unused_30d": len(unused), f"not_edited_in_{stale_days}_days": len(stale),
+                "duplicate_groups": len(dupes),
+                "tickets_with_a_macro_pct": rate(len(with_macro), n_audited),
+            },
+            "most_used_30d": [{"title": m.get("title"), "id": m["id"], "usage_30d": m.get("usage_30d") or 0,
+                               "usage_7d": m.get("usage_7d") or 0}
+                              for m in sorted(active, key=lambda m: -(m.get("usage_30d") or 0))[:limit]
+                              if m.get("usage_30d")],
+            "outcomes": {"tickets_without_macros": base, "by_macro": perf[:limit],
+                         "note": "Outcomes are associations, not causes: macros are used on different kinds of "
+                                 "tickets. Flags point at macros worth re-reading."},
+            "unused_30d": [brief(m) for m in unused[:limit]],
+            "stale": [brief(m) for m in stale[:limit]],
+            "likely_duplicates": dupes[:limit],
+        }
+        if not team_level:
+            result["by_agent"] = [{"agent": a, "macro_uses": n} for a, n in by_agent.most_common(25)]
+        return tk.out(result)
